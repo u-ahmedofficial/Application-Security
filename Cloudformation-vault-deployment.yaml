@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a HashiCorp Vault server with CloudTrail and AWS Secrets Manager integration.
+
+Parameters:
+  VaultInstanceType:
+    Description: EC2 Instance Type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+  VaultAMI:
+    Description: AMI ID for Vault Server
+    Type: String
+    Default: ami-09eb2ed0e9c2f6126  # Be careful this is region specific
+
+Resources:
+  VaultSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: 'VaultSecret'
+      Description: 'Secret for the Vault server'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"vaultuser"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt VaultInstanceRole.Arn
+            Action:
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:UpdateSecret'
+            Resource: '*'
+          - Effect: Deny
+            Principal: '*'
+            Action:
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:UpdateSecret'
+            Resource: '*'
+            Condition:
+              StringNotLike:
+                aws:userId: '*'
+
+  VaultInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AccessAndUpdateVaultSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:UpdateSecret'
+                Resource: !Ref VaultSecret
+
+  VaultInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref VaultInstanceRole
+
+  VaultSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security Group for Vault Server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '8200'
+          ToPort: '8200'
+          CidrIp: 0.0.0.0/0  # Modify with your IP range
+
+  VaultServerInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: !Ref VaultInstanceType
+      ImageId: !Ref VaultAMI
+      SecurityGroups:
+        - !Ref VaultSecurityGroup
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y curl jq unzip
+          VAULT_VERSION="1.15.5"
+          curl -O https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip
+          unzip vault_${VAULT_VERSION}_linux_amd64.zip
+          mv vault /usr/local/bin/
+          vault -autocomplete-install
+          complete -C /usr/local/bin/vault vault
+          mkdir -p /etc/vault.d
+          cat <<EOF > /etc/vault.d/vault.hcl
+          ui = true
+          storage "file" {
+            path = "/opt/vault/data"
+          }
+          listener "tcp" {
+            address     = "0.0.0.0:8200"
+            tls_disable = 1
+          }
+          EOF
+          vault server -config=/etc/vault.d/vault.hcl &
+          sleep 10
+          # Check if Vault is initialized
+          VAULT_INITIALIZED=$(vault status -format=json | jq -r ".initialized")
+          if [ "$VAULT_INITIALIZED" = "false" ]; then
+            VAULT_INIT=$(vault operator init -format=json)
+            VAULT_UNSEAL_KEYS=$(echo $VAULT_INIT | jq -r ".unseal_keys_b64[]")
+            VAULT_ROOT_TOKEN=$(echo $VAULT_INIT | jq -r ".root_token")
+            for key in $VAULT_UNSEAL_KEYS; do
+              aws secretsmanager create-secret --name "vault-unseal-key-$key" --secret-string "$key"
+            done
+            aws secretsmanager create-secret --name "vault-root-token" --secret-string "$VAULT_ROOT_TOKEN"
+          else
+            for key in $(aws secretsmanager list-secrets --query "SecretList[?starts_with(Name, 'vault-unseal-key-')].Name" --output text); do
+              UNSEAL_KEY=$(aws secretsmanager get-secret-value --secret-id $key --query SecretString --output text)
+              vault operator unseal $UNSEAL_KEY
+            done
+          fi
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+          rm -rf awscliv2.zip aws vault_${VAULT_VERSION}_linux_amd64.zip
+          echo "Vault installation and initialization complete."
+
+
+  VaultCloudTrail:
+    Type: 'AWS::CloudTrail::Trail'
+    Properties:
+      TrailName: VaultActivity
+      S3BucketName: !Ref VaultCloudTrailBucket
+      EventSelectors:
+        - DataResources:
+            - Type: AWS::SecretsManager::Secret
+              Values: ["arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:VaultSecret-*"]
+          IncludeManagementEvents: true
+          ReadWriteType: All
+
+  VaultCloudTrailBucket:
+    Type: 'AWS::S3::Bucket'
+
+Outputs:
+  VaultServerIP:
+    Description: The Public IP address of the Vault server
+    Value: !GetAtt VaultServerInstance.PublicIp
